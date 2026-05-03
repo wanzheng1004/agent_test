@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: bridge-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: bridge123
+      MYSQL_DATABASE: bridge_mgmt
+      MYSQL_USER: bridge
+      MYSQL_PASSWORD: bridge123
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./src/main/resources/db/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --ft_min_word_len=2
+      --ngram_token_size=2
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: bridge-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  qdrant:
+    image: qdrant/qdrant:v1.9.0
+    container_name: bridge-qdrant
+    ports:
+      - "6333:6333"   # REST API
+      - "6334:6334"   # gRPC (Spring AI 使用 gRPC)
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+
+volumes:
+  mysql_data:
+  redis_data:
+  qdrant_data:

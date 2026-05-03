@@ -1,0 +1,83 @@
+spring:
+  application:
+    name: bridge-agent
+
+  # ===== 数据源 (MySQL) =====
+  datasource:
+    url: jdbc:mysql://localhost:3306/bridge_mgmt?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai
+    username: ${DB_USER:bridge}
+    password: ${DB_PASS:bridge123}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+
+  jpa:
+    hibernate:
+      ddl-auto: none          # 建表由 schema.sql 控制，不让 Hibernate 自动管理
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQLDialect
+        format_sql: true
+
+  # ===== Redis (会话级记忆) =====
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 3000ms
+      lettuce:
+        pool:
+          max-active: 8
+          max-idle: 4
+
+  # ===== Spring AI =====
+  ai:
+    openai:
+      api-key: ${OPENAI_API_KEY}
+      base-url: ${OPENAI_BASE_URL:https://api.openai.com}
+      chat:
+        options:
+          model: gpt-4o
+          temperature: 0.1      # 低温度保证输出稳定，利于 ReAct 格式解析
+          max-tokens: 2048
+      embedding:
+        options:
+          model: text-embedding-3-small  # 1536 维，与 Qdrant collection 维度对应
+
+    vectorstore:
+      qdrant:
+        host: ${QDRANT_HOST:localhost}
+        port: 6334              # gRPC 端口
+        collection-name: bridge_standards   # 默认 collection（规范文档）
+        initialize-schema: true
+
+  # ===== 缓存 =====
+  cache:
+    type: redis
+    redis:
+      time-to-live: 86400000   # 默认 TTL 24h（ms）
+
+# ===== 应用自定义配置 =====
+bridge:
+  agent:
+    react:
+      max-iterations: 8         # ReAct 最大循环次数
+      max-consecutive-errors: 2 # 连续错误上限触发终止
+    context:
+      full-window-size: 20      # 保留最近 N 轮完整对话
+      summary-threshold: 30     # 超过 N 轮触发压缩摘要
+    session:
+      ttl-hours: 8              # Redis 会话 TTL（小时）
+    rag:
+      sparse-top-k: 20          # BM25 召回数量
+      dense-top-k: 20           # 向量检索召回数量
+      rerank-top-n: 5           # Reranker 精排输入数量
+      final-top-k: 3            # 最终送入 LLM 的上下文数量
+
+# ===== 日志 =====
+logging:
+  level:
+    com.bridge.agent: DEBUG
+    org.springframework.ai: INFO
