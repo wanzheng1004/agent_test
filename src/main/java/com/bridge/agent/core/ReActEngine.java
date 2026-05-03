@@ -206,6 +206,8 @@ public class ReActEngine {
         // 将轨迹和当前问题拼入 user message
         String userMessage = buildUserMessage(ctx.getTrajectoryText(), userInput);
 
+        // 通过 AdvisorSpec.param() 向 Advisor 链传递 sessionId 和 agentName
+        // Advisor 在 request.context().get("...") 中读取这些值
         return chatClient.prompt()
                 .system(systemPrompt
                         .replace("{toolDescriptions}", toolDescriptions)
@@ -213,6 +215,9 @@ public class ReActEngine {
                         .replace("{userInput}", userInput))
                 .messages(history)
                 .user(userMessage)
+                .advisors(spec -> spec
+                        .param("agentName", ctx.getAgentName())
+                        .param("sessionId", ctx.getSessionId()))
                 .call()
                 .content();
     }
@@ -249,6 +254,9 @@ public class ReActEngine {
         String corrected = chatClient.prompt()
                 .system(correctionPrompt)
                 .user("基于已有轨迹：\n" + ctx.getTrajectoryText())
+                .advisors(spec -> spec
+                        .param("agentName", ctx.getAgentName())
+                        .param("sessionId", ctx.getSessionId()))
                 .call()
                 .content();
 
@@ -281,6 +289,7 @@ public class ReActEngine {
                     .system("根据已收集到的部分信息，尽力回答用户问题。" +
                             "如有未完成的部分，诚实说明，不要编造数据。")
                     .user("用户问题：" + userInput + "\n\n已收集信息：\n" + collectedInfo)
+                    .advisors(spec -> spec.param("agentName", ctx.getAgentName()))
                     .call()
                     .content();
         }

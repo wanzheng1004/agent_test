@@ -8,6 +8,7 @@ import com.bridge.agent.core.AgentContext;
 import com.bridge.agent.core.plan.PlanExecuteContext;
 import com.bridge.agent.memory.ContextWindowManager;
 import com.bridge.agent.memory.SessionMemoryStore;
+import com.bridge.agent.memory.UserPreferenceService;
 import com.bridge.agent.orchestrator.dto.ChatRequest;
 import com.bridge.agent.orchestrator.dto.IntentResult;
 import com.bridge.agent.orchestrator.dto.SlotCheckResult;
@@ -43,6 +44,7 @@ public class AgentOrchestrator {
     private final SlotValidator slotValidator;
     private final SessionMemoryStore sessionStore;
     private final ContextWindowManager contextManager;
+    private final UserPreferenceService userPreferenceService;
     private final PreInspectionAgent preAgent;
     private final DuringInspectionAgent duringAgent;
     private final PostInspectionAgent postAgent;
@@ -52,6 +54,7 @@ public class AgentOrchestrator {
                                SlotValidator slotValidator,
                                SessionMemoryStore sessionStore,
                                ContextWindowManager contextManager,
+                               UserPreferenceService userPreferenceService,
                                PreInspectionAgent preAgent,
                                DuringInspectionAgent duringAgent,
                                PostInspectionAgent postAgent,
@@ -60,6 +63,7 @@ public class AgentOrchestrator {
         this.slotValidator = slotValidator;
         this.sessionStore = sessionStore;
         this.contextManager = contextManager;
+        this.userPreferenceService = userPreferenceService;
         this.preAgent = preAgent;
         this.duringAgent = duringAgent;
         this.postAgent = postAgent;
@@ -73,10 +77,20 @@ public class AgentOrchestrator {
      */
     public String chat(ChatRequest request) {
         String sessionId = request.sessionId();
+        // userMessage 可能被术语映射修改，用非 final 局部变量
         String userMessage = request.message();
 
         log.info("Orchestrator received request: sessionId={}, messageLen={}",
                 sessionId, userMessage.length());
+
+        // ============================================================
+        // Step 0: 用户级记忆 — 术语映射（纯 Java，不调 LLM）
+        // 将用户惯用非标准术语替换为规范术语，提高意图分类准确率
+        // ============================================================
+        String userId = request.userId();
+        if (userId != null && !userId.isBlank()) {
+            userMessage = userPreferenceService.applyTerminologyMapping(userId, userMessage);
+        }
 
         // ============================================================
         // Step 1: 意图分类（单次 LLM 调用，有结构化输出）
@@ -87,6 +101,14 @@ public class AgentOrchestrator {
         // 将识别到的 bridgeId 存入会话元数据，供后续轮次复用
         if (intent.bridgeId() != null) {
             sessionStore.setMeta(sessionId, "bridgeId", intent.bridgeId());
+            // 用户级记忆：将本次操作的桥梁加入常用列表（后台更新，不影响主流程）
+            if (userId != null && !userId.isBlank()) {
+                try {
+                    userPreferenceService.addPreferredBridge(userId, intent.bridgeId());
+                } catch (Exception e) {
+                    log.debug("Failed to update preferred bridges: {}", e.getMessage());
+                }
+            }
         }
         // 如果本次没有识别到 bridgeId，尝试从会话元数据中读取（上轮已提供过）
         String bridgeId = intent.bridgeId() != null
@@ -103,7 +125,7 @@ public class AgentOrchestrator {
 
         SlotCheckResult slotCheck = slotValidator.validate(enrichedIntent);
 
-        if (!slotCheck.isComplete()) {
+        if (!slotCheck.complete()) {
             // 槽位不足：直接返回引导性追问，不进入任何 Agent
             log.info("Slot check failed: missing={}, asking user",
                     slotCheck.missingSlotKey());

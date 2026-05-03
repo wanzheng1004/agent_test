@@ -186,8 +186,12 @@ public class FourStageRagPipeline {
      * 向量库时，这里代码无需修改。
      */
     private List<ScoredDoc> denseSearch(String query) {
-        List<Document> docs = vectorStore.similaritySearch(
-                SearchRequest.query(query).withTopK(denseTopK));
+        SearchRequest request = SearchRequest.builder()
+                .query(query)
+                .topK(denseTopK)
+                .build();
+
+        List<Document> docs = vectorStore.similaritySearch(request);
 
         return IntStream.range(0, docs.size())
                 .mapToObj(i -> {

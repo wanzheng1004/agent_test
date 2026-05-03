@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mvn dependency:tree -q)",
+      "Bash(mvn dependency:resolve -q)",
+      "Bash(jar tf *)",
+      "Bash(grep -v \"\\\\$\")",
+      "Read(//d/tmp/**)",
+      "Bash(jar xf *)",
+      "Bash(javap -p org/springframework/ai/chat/client/advisor/api/CallAdvisor.class)",
+      "Bash(javap -p org/springframework/ai/chat/client/advisor/api/Advisor.class)",
+      "Bash(javap -p org/springframework/ai/chat/client/ChatClientRequest.class)",
+      "Bash(javap -p 'org/springframework/ai/chat/client/ChatClientRequest$Builder.class')",
+      "Bash(javap -p org/springframework/ai/chat/client/ChatClientResponse.class)",
+      "Bash(javap -p org/springframework/ai/chat/client/advisor/api/CallAdvisorChain.class)",
+      "Bash(javap -p org/springframework/ai/chat/client/advisor/api/BaseAdvisor.class)",
+      "Bash(javap -p 'org/springframework/ai/chat/client/ChatClient$AdvisorSpec.class')",
+      "Bash(grep -l \"CallAroundAdvisor\\\\|AdvisedRequest\\\\|AdvisedResponse\" \"D:/workplace/ai-agent/bridge-agent-3.0/src/main/java/com/bridge/agent/advisor/\"*)",
+      "Bash(echo \"exit:$?\")"
+    ]
+  }
+}

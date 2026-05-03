@@ -2,37 +2,38 @@ package com.bridge.agent.advisor;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.ai.chat.client.advisor.api.AdvisedRequest;
-import org.springframework.ai.chat.client.advisor.api.AdvisedResponse;
-import org.springframework.ai.chat.client.advisor.api.CallAroundAdvisor;
-import org.springframework.ai.chat.client.advisor.api.CallAroundAdvisorChain;
-import org.springframework.ai.chat.metadata.Usage;
+import org.springframework.ai.chat.client.ChatClientRequest;
+import org.springframework.ai.chat.client.ChatClientResponse;
+import org.springframework.ai.chat.client.advisor.api.AdvisorChain;
+import org.springframework.ai.chat.client.advisor.api.BaseAdvisor;
 import org.springframework.core.Ordered;
 import org.springframework.stereotype.Component;
 
 /**
  * 日志 Advisor —— 记录每次 LLM 调用的关键指标
  *
- * <p>通过实现 Spring AI 的 CallAroundAdvisor 接口，
- * 在 LLM 调用前后插入日志逻辑，类似 AOP 的 @Around。
+ * <p>Spring AI 1.0.0 正确实现：实现 {@link BaseAdvisor} 接口，
+ * 重写 before/after 模板方法（不是 aroundCall）。
  *
  * <p>面试要点：
- * "Advisor 是 Spring AI 的横切关注点机制，类比 Spring AOP 的 @Around。
- *  每个 Agent 的 ChatClient 都挂载了 LoggingAdvisor，
- *  不需要在每个 Agent 里重复写日志代码。"
+ * "Spring AI 1.0.0 的 BaseAdvisor 用模板方法模式，
+ *  before() 在 LLM 调用前执行，after() 在 LLM 调用后执行，
+ *  框架的 adviseCall() 默认实现负责在 before/after 之间调用 chain.nextCall()。
+ *  类比 Spring AOP 的 @Before + @After，但更轻量，不需要 AspectJ。"
  *
- * <p>记录内容：
- * <ul>
- *   <li>Agent 名称（来自 advisorContext）</li>
- *   <li>系统提示 token 数（估算）</li>
- *   <li>LLM 调用耗时</li>
- *   <li>Prompt/Completion/Total token 消耗</li>
- * </ul>
+ * <p>Context 传递：Agent 通过
+ * {@code chatClient.prompt().advisors(spec -> spec.param("agentName", name))}
+ * 注入上下文，advisor 通过 {@code request.context().get("agentName")} 读取。
  */
 @Component
-public class LoggingAdvisor implements CallAroundAdvisor {
+public class LoggingAdvisor implements BaseAdvisor {
 
     private static final Logger log = LoggerFactory.getLogger(LoggingAdvisor.class);
+
+    // ThreadLocal 记录每次调用的开始时间（before → after 之间）
+    private final ThreadLocal<Long> startTimeHolder = new ThreadLocal<>();
+    // ThreadLocal 记录 agentName（before 存，after 读）
+    private final ThreadLocal<String> agentNameHolder = new ThreadLocal<>();
 
     @Override
     public String getName() {
@@ -41,42 +42,48 @@ public class LoggingAdvisor implements CallAroundAdvisor {
 
     @Override
     public int getOrder() {
-        return Ordered.HIGHEST_PRECEDENCE; // 最先执行，包裹整个调用链
+        return Ordered.HIGHEST_PRECEDENCE; // 最先执行，包裹整个 Advisor 链
     }
 
+    /**
+     * LLM 调用前：记录开始时间和 Agent 名称
+     */
     @Override
-    public AdvisedResponse aroundCall(AdvisedRequest advisedRequest,
-                                       CallAroundAdvisorChain chain) {
-        long start = System.currentTimeMillis();
+    public ChatClientRequest before(ChatClientRequest request, AdvisorChain chain) {
+        startTimeHolder.set(System.currentTimeMillis());
 
-        // 从 advisorContext 中获取 Agent 名称（由 Agent 调用时设置）
-        String agentName = (String) advisedRequest.adviseContext()
-                .getOrDefault("agentName", "unknown-agent");
-        String scene = (String) advisedRequest.adviseContext()
-                .getOrDefault("scene", "");
+        String agentName = (String) request.context().getOrDefault("agentName", "unknown-agent");
+        agentNameHolder.set(agentName);
 
-        log.debug("[{}{}] LLM call started, systemPromptLen={}",
-                agentName, scene.isBlank() ? "" : "/" + scene,
-                advisedRequest.systemText() != null ? advisedRequest.systemText().length() : 0);
+        log.debug("[{}] LLM call started | contextKeys={}",
+                agentName, request.context().keySet());
+        return request; // 不修改请求，直接透传
+    }
 
-        // 执行实际 LLM 调用
-        AdvisedResponse response = chain.nextAroundCall(advisedRequest);
+    /**
+     * LLM 调用后：计算耗时，输出 token 消耗
+     */
+    @Override
+    public ChatClientResponse after(ChatClientResponse response, AdvisorChain chain) {
+        long elapsed = System.currentTimeMillis() - startTimeHolder.get();
+        String agentName = agentNameHolder.get();
 
-        long elapsed = System.currentTimeMillis() - start;
+        // 清理 ThreadLocal，防止内存泄漏
+        startTimeHolder.remove();
+        agentNameHolder.remove();
 
-        // 提取 token 使用量
         try {
-            Usage usage = response.response().getMetadata().getUsage();
-            log.info("[{}] LLM call completed | {}ms | prompt={} completion={} total={} tokens",
+            var usage = response.chatResponse().getMetadata().getUsage();
+            log.info("[{}] LLM call done | {}ms | prompt={} completion={} total={} tokens",
                     agentName, elapsed,
                     usage.getPromptTokens(),
-                    usage.getGenerationTokens(),
+                    usage.getCompletionTokens(),
                     usage.getTotalTokens());
         } catch (Exception e) {
-            // usage 可能为 null（测试 mock 时）
-            log.info("[{}] LLM call completed | {}ms", agentName, elapsed);
+            // usage 在 mock 或异常情况下可能为 null
+            log.info("[{}] LLM call done | {}ms", agentName, elapsed);
         }
 
-        return response;
+        return response; // 不修改响应，直接透传
     }
 }

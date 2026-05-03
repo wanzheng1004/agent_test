@@ -148,6 +148,7 @@ public class PlanExecuteEngine {
         String response = chatClient.prompt()
                 .system(prompt)
                 .user(userMsg)
+                .advisors(spec -> spec.param("agentName", "PlanExecuteEngine/Planner"))
                 .call()
                 .content();
 
@@ -234,6 +235,7 @@ public class PlanExecuteEngine {
         return chatClient.prompt()
                 .system(synthesizerPrompt)
                 .user(userMsg)
+                .advisors(spec -> spec.param("agentName", "PlanExecuteEngine/Synthesizer"))
                 .call()
                 .content();
     }
