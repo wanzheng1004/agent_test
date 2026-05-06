@@ -1,17 +1,20 @@
 package com.bridge.agent.rag;
 
+import com.bridge.agent.llm.OpenAiCompatibleChatService;
 import com.bridge.agent.repository.DefectRecordRepository;
-import com.bridge.agent.util.JsonUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
-import java.util.*;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -24,7 +27,7 @@ import java.util.stream.IntStream;
  *   - 路径A（稀疏）：MySQL FULLTEXT BM25 检索
  *   - 路径B（稠密）：Qdrant 向量语义检索
  * <p>Stage 3: RRF 融合（Reciprocal Rank Fusion）
- * <p>Stage 4: LLM Reranker 精排
+ * <p>Stage 4: BGE Reranker 精排。
  *
  * <p>面试要点：
  * <ul>
@@ -49,7 +52,8 @@ public class FourStageRagPipeline {
 
     private final VectorStore vectorStore;
     private final DefectRecordRepository defectRepo;
-    private final ChatClient chatClient;
+    private final OpenAiCompatibleChatService qwenClient;
+    private final BgeRerankerClient rerankerClient;
 
     @Value("${bridge.agent.rag.sparse-top-k:20}")
     private int sparseTopK;
@@ -64,11 +68,13 @@ public class FourStageRagPipeline {
     private int finalTopK;
 
     public FourStageRagPipeline(VectorStore vectorStore,
-                                  DefectRecordRepository defectRepo,
-                                  ChatClient.Builder builder) {
+                                DefectRecordRepository defectRepo,
+                                OpenAiCompatibleChatService qwenClient,
+                                BgeRerankerClient rerankerClient) {
         this.vectorStore = vectorStore;
         this.defectRepo = defectRepo;
-        this.chatClient = builder.build();
+        this.qwenClient = qwenClient;
+        this.rerankerClient = rerankerClient;
     }
 
     /**
@@ -127,7 +133,7 @@ public class FourStageRagPipeline {
         // ==========================================
         long rerankStart = System.currentTimeMillis();
         List<ScoredDoc> toRerank = fused.subList(0, Math.min(rerankTopN, fused.size()));
-        List<ScoredDoc> reranked = llmRerank(query, toRerank);
+        List<ScoredDoc> reranked = rerankerClient.rerank(query, toRerank, finalTopK);
         result.setFinalResults(reranked);
         result.setRerankLatencyMs(System.currentTimeMillis() - rerankStart);
 
@@ -148,31 +154,38 @@ public class FourStageRagPipeline {
      *   配合 Boolean Mode 可以做关键词精确匹配（条款号如 "6.3.2"）。
      */
     private List<ScoredDoc> sparseSearch(String query) {
-        // 对 MySQL FULLTEXT，用 + 操作符做必须出现的关键词检索
         String booleanQuery = Arrays.stream(query.split("\\s+"))
                 .filter(w -> w.length() >= 2)
                 .map(w -> "+" + w + "*")
                 .collect(Collectors.joining(" "));
-        if (booleanQuery.isBlank()) booleanQuery = query;
+        if (booleanQuery.isBlank()) {
+            booleanQuery = query;
+        }
 
-        return defectRepo.fullTextSearchGlobal(booleanQuery, sparseTopK).stream()
+        String finalBooleanQuery = booleanQuery;
+        return defectRepo.fullTextSearchGlobal(finalBooleanQuery, sparseTopK).stream()
                 .map(defect -> new ScoredDoc(
                         "defect-" + defect.getId(),
                         formatDefectAsDoc(defect),
                         "SPARSE",
-                        1.0, // MySQL FULLTEXT 不返回原始分数，统一设为1.0（RRF 只看排名）
-                        Map.of("type", "defect_record",
-                               "bridgeId", defect.getBridgeId() != null ? defect.getBridgeId() : "",
-                               "defectType", defect.getDefectType() != null ? defect.getDefectType() : "")
+                        1.0,
+                        Map.of(
+                                "type", "defect_record",
+                                "bridgeId", defect.getBridgeId() != null ? defect.getBridgeId() : "",
+                                "defectType", defect.getDefectType() != null ? defect.getDefectType() : ""
+                        )
                 ))
                 .collect(Collectors.toList());
     }
 
-    private String formatDefectAsDoc(com.bridge.agent.entity.DefectRecord d) {
+    private String formatDefectAsDoc(com.bridge.agent.entity.DefectRecord defect) {
         return String.format("【%s】%s\n病害类型：%s，等级：%s类，规范依据：%s\n%s",
-                d.getComponent(), d.getDescription(),
-                d.getDefectType(), d.getGrade(), d.getStandardRef(),
-                d.getGradeReason() != null ? d.getGradeReason() : "");
+                defect.getComponent(),
+                defect.getDescription(),
+                defect.getDefectType(),
+                defect.getGrade(),
+                defect.getStandardRef(),
+                defect.getGradeReason() != null ? defect.getGradeReason() : "");
     }
 
     // =====================================================
@@ -242,106 +255,20 @@ public class FourStageRagPipeline {
         // 按融合分数降序，返回带 FUSED 来源标记的文档
         return scores.entrySet().stream()
                 .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
-                .map(e -> docMap.get(e.getKey()).withScore(e.getValue())
+                .map(entry -> docMap.get(entry.getKey())
+                        .withScore(entry.getValue())
                         .withSource("FUSED"))
                 .collect(Collectors.toList());
     }
 
-    // =====================================================
-    // Stage 4: LLM Reranker 精排
-    // =====================================================
-
-    /**
-     * 使用 LLM 作为 listwise reranker，对候选文档重新排序。
-     *
-     * <p>面试要点：
-     * "Reranker 有两种选择：
-     *  (1) 部署 cross-encoder 模型（如 bge-reranker-v2-m3），速度快但需要额外部署；
-     *  (2) LLM-as-Reranker，让 LLM 判断每个候选文档与查询的相关性。
-     *  我们选择 LLM-as-Reranker，免部署，且对中文专业术语理解更好。
-     *  代价是多一次 LLM 调用，但 finalTopK=3 时候选文档很少，延迟可接受。"
-     */
-    private List<ScoredDoc> llmRerank(String originalQuery, List<ScoredDoc> candidates) {
-        if (candidates.size() <= 1) return candidates;
-
-        // 构造候选文档描述（带编号）
-        StringBuilder candidateText = new StringBuilder();
-        for (int i = 0; i < candidates.size(); i++) {
-            candidateText.append(String.format("[%d] %s\n\n", i, candidates.get(i).content()));
-        }
-
-        String prompt = String.format("""
-                查询：%s
-
-                候选文档：
-                %s
-
-                请按与查询的相关性从高到低排序，返回文档编号数组（JSON）。
-                只返回JSON，不要解释。格式：{"rankedIndices": [2, 0, 1]}
-                """, originalQuery, candidateText);
-
-        try {
-            String response = chatClient.prompt()
-                    .system("你是桥梁规范文档检索结果排序专家。")
-                    .user(prompt)
-                    .call()
-                    .content();
-
-            // 解析排序结果
-            String json = extractJson(response);
-            int[] rankedIndices = parseRankedIndices(json, candidates.size());
-
-            return Arrays.stream(rankedIndices)
-                    .filter(idx -> idx >= 0 && idx < candidates.size())
-                    .limit(finalTopK)
-                    .mapToObj(candidates::get)
-                    .collect(Collectors.toList());
-
-        } catch (Exception e) {
-            log.warn("LLM reranking failed, fallback to RRF order: {}", e.getMessage());
-            return candidates.subList(0, Math.min(finalTopK, candidates.size()));
-        }
-    }
-
-    // =====================================================
-    // Stage 1: 查询改写（可选）
-    // =====================================================
-
     private boolean needsRewrite(String query) {
-        // 短查询或不含关键词时触发改写（超过 10 字的查询通常无需改写）
         return query.length() < 8 || query.split("\\s+").length < 2;
     }
 
     private String rewriteQuery(String query) {
-        return chatClient.prompt()
-                .system("将以下桥梁检测相关的短查询扩展为更完整的搜索描述（不超过20字），保持专业术语，只输出改写后的查询文本。")
-                .user(query)
-                .call()
-                .content().trim();
-    }
-
-    // =====================================================
-    // 工具方法
-    // =====================================================
-
-    private String extractJson(String response) {
-        if (response == null) return "{}";
-        int start = response.indexOf('{');
-        int end = response.lastIndexOf('}');
-        return (start >= 0 && end > start) ? response.substring(start, end + 1) : "{}";
-    }
-
-    private int[] parseRankedIndices(String json, int maxSize) {
-        try {
-            String indicesStr = JsonUtil.getString(json, "rankedIndices");
-            // 简单处理：解析数组
-            String cleaned = json.replaceAll("[^0-9,]", "").replaceAll(",+", ",")
-                    .replaceAll("^,|,$", "");
-            if (cleaned.isEmpty()) return IntStream.range(0, maxSize).toArray();
-            return Arrays.stream(cleaned.split(","))
-                    .mapToInt(Integer::parseInt).toArray();
-        } catch (Exception e) {
-            return IntStream.range(0, maxSize).toArray();
-        }
+        return qwenClient.complete(
+                "你是桥梁巡检规范检索改写助手。请将用户短查询改写为更适合规范检索的搜索表达，不超过20字，只输出改写后的查询文本。",
+                query
+        ).trim();
     }
 }

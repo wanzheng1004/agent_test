@@ -1,8 +1,8 @@
 package com.bridge.agent.memory;
 
+import com.bridge.agent.llm.OpenAiCompatibleChatService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.beans.factory.annotation.Value;
@@ -39,7 +39,7 @@ public class ContextWindowManager {
     private static final Logger log = LoggerFactory.getLogger(ContextWindowManager.class);
 
     private final SessionMemoryStore sessionStore;
-    private final ChatClient chatClient;
+    private final OpenAiCompatibleChatService qwenClient;
     private final String summaryPrompt;
 
     @Value("${bridge.agent.context.full-window-size:20}")
@@ -49,9 +49,9 @@ public class ContextWindowManager {
     private int summaryThreshold;
 
     public ContextWindowManager(SessionMemoryStore sessionStore,
-                                  ChatClient.Builder builder) {
+                                OpenAiCompatibleChatService qwenClient) {
         this.sessionStore = sessionStore;
-        this.chatClient = builder.build();
+        this.qwenClient = qwenClient;
         this.summaryPrompt = loadPrompt();
     }
 
@@ -91,20 +91,18 @@ public class ContextWindowManager {
 
         // 调用 LLM 生成摘要
         String historyText = oldMessages.stream()
-                .map(m -> (m instanceof org.springframework.ai.chat.messages.UserMessage ? "用户：" : "助手：")
+                .map(m -> (m instanceof org.springframework.ai.chat.messages.UserMessage ? "用户: " : "助手: ")
                         + m.getText())
                 .collect(Collectors.joining("\n"));
 
         String summary;
         try {
-            summary = chatClient.prompt()
-                    .system(summaryPrompt.replace("{conversationHistory}", historyText))
-                    .user("请生成摘要。")
-                    .call()
-                    .content();
+            summary = qwenClient.complete(
+                    summaryPrompt.replace("{conversationHistory}", historyText),
+                    "请生成后续对话可复用的压缩摘要。");
         } catch (Exception e) {
             log.warn("Context compression failed, using raw truncation: {}", e.getMessage());
-            summary = "（历史对话已压缩，部分细节不可用）";
+            summary = "（历史对话已压缩，部分细节暂不可用）";
         }
 
         // 构建压缩后的消息列表
@@ -120,7 +118,7 @@ public class ContextWindowManager {
             return new ClassPathResource("prompts/context-summary.st")
                     .getContentAsString(StandardCharsets.UTF_8);
         } catch (IOException e) {
-            return "请将以下对话历史压缩为简洁摘要，重点保留：桥梁编号、已确认病害、未解决问题。\n对话历史：{conversationHistory}";
+            return "请将以下对话历史压缩成简洁摘要，重点保留桥梁编号、已确认病害和未解决问题。\n对话历史：\n{conversationHistory}";
         }
     }
 }
