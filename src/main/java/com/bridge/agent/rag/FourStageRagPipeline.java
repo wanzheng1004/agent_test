@@ -2,6 +2,7 @@ package com.bridge.agent.rag;
 
 import com.bridge.agent.llm.OpenAiCompatibleChatService;
 import com.bridge.agent.repository.DefectRecordRepository;
+import com.bridge.agent.repository.DefectSearchHit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.document.Document;
@@ -10,56 +11,67 @@ import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
-import java.util.Arrays;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
+import java.util.Objects;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
-import java.util.stream.IntStream;
 
 /**
  * 四阶段 RAG 管道 —— 显式分阶段实现
  *
- * <p>Stage 1: 查询改写（可选，短查询自动跳过）
+ * <p>Stage 1: 查询改写（可选，短查询自动触发）
  * <p>Stage 2: 双路检索（并行）
- *   - 路径A（稀疏）：MySQL FULLTEXT BM25 检索
+ *   - 路径A（稀疏）：MySQL FULLTEXT 稀疏检索
  *   - 路径B（稠密）：Qdrant 向量语义检索
  * <p>Stage 3: RRF 融合（Reciprocal Rank Fusion）
- * <p>Stage 4: BGE Reranker 精排。
+ * <p>Stage 4: BGE Reranker 精排
+ *
+ * <p>本轮优化重点：
+ * <ul>
+ *   <li>sparse 路径使用 MySQL 返回的真实 FULLTEXT score</li>
+ *   <li>接入 Jieba 中文分词，替换旧版“按空格切词 + Boolean Query”</li>
+ *   <li>dense 路径优先读取真实相似度分数，拿不到再退化</li>
+ *   <li>RRF 前限制候选集合大小，rerank 前做去重</li>
+ *   <li>利用 bridgeId / defectType 等 metadata 做过滤和加权</li>
+ * </ul>
  *
  * <p>面试要点：
- * <ul>
- *   <li>为什么用 RRF 不用分数加权？
- *       BM25 分数和余弦相似度不在同一尺度，直接加权没有意义。
- *       RRF 只看排名不看分数，天然解决尺度不一致问题。</li>
- *   <li>为什么不用 Spring AI 的 QuestionAnswerAdvisor 封装？
- *       它把检索、融合、重排全封装了，无法分阶段调优，
- *       也无法保留每阶段中间结果用于分析。</li>
- *   <li>BM25（精确匹配条款号）+ 向量（语义相关）互补：
- *       检索员说"JTG/T H21-2011 6.3.2"→ BM25 精确命中；
- *       检索员说"桥墩裂缝怎么定级"→ 向量检索语义匹配。</li>
- * </ul>
+ * "RAG 的关键不只是双路召回，而是把 query 信号、检索分数、metadata 过滤、
+ *  融合候选控制和 rerank 前去重这些细节真正做实。否则骨架看起来完整，
+ *  实际召回质量和可解释性都上不去。"
  */
 @Service
 public class FourStageRagPipeline {
 
     private static final Logger log = LoggerFactory.getLogger(FourStageRagPipeline.class);
-
-    /** RRF 融合参数 k=60 是标准值，实测 40-60 差异不大 */
     private static final int RRF_K = 60;
+    private static final Pattern BRIDGE_ID_PATTERN = Pattern.compile("BRG-\\d+", Pattern.CASE_INSENSITIVE);
+    private static final Pattern STANDARD_REF_PATTERN = Pattern.compile("(JTG|JTG/T|JTG-T|6\\.\\d+\\.\\d+)", Pattern.CASE_INSENSITIVE);
+    private static final List<String> DEFECT_TYPE_KEYWORDS = List.of(
+            "裂缝", "坑槽", "变形", "破损", "腐蚀", "渗水", "剥落", "露筋", "蜂窝", "麻面"
+    );
 
     private final VectorStore vectorStore;
     private final DefectRecordRepository defectRepo;
     private final OpenAiCompatibleChatService qwenClient;
     private final BgeRerankerClient rerankerClient;
+    private final ChineseQueryTokenizer queryTokenizer;
 
     @Value("${bridge.agent.rag.sparse-top-k:20}")
     private int sparseTopK;
 
     @Value("${bridge.agent.rag.dense-top-k:20}")
     private int denseTopK;
+
+    @Value("${bridge.agent.rag.fusion-top-k:12}")
+    private int fusionTopK;
 
     @Value("${bridge.agent.rag.rerank-top-n:5}")
     private int rerankTopN;
@@ -70,44 +82,49 @@ public class FourStageRagPipeline {
     public FourStageRagPipeline(VectorStore vectorStore,
                                 DefectRecordRepository defectRepo,
                                 OpenAiCompatibleChatService qwenClient,
-                                BgeRerankerClient rerankerClient) {
+                                BgeRerankerClient rerankerClient,
+                                ChineseQueryTokenizer queryTokenizer) {
         this.vectorStore = vectorStore;
         this.defectRepo = defectRepo;
         this.qwenClient = qwenClient;
         this.rerankerClient = rerankerClient;
+        this.queryTokenizer = queryTokenizer;
     }
 
     /**
-     * 执行完整四阶段管道，返回分阶段结果
+     * 执行完整四阶段流程，返回分阶段结果
      */
     public RagResult retrieve(String query) {
         RagResult result = new RagResult(query);
-        log.debug("RAG pipeline started: query={}", query);
+        QuerySignals signals = analyzeQuery(query);
+        log.debug("RAG pipeline started: query={}, signals={}", query, signals);
 
         // ==========================================
-        // Stage 1: 查询改写（短查询跳过）
+        // Stage 1: 查询改写（短查询触发）
         // ==========================================
         String searchQuery = query;
-        if (needsRewrite(query)) {
+        if (needsRewrite(query, signals)) {
             searchQuery = rewriteQuery(query);
             result.setRewrittenQuery(searchQuery);
-            log.debug("Query rewritten: {} → {}", query, searchQuery);
+            signals = analyzeQuery(searchQuery);
+            log.debug("Query rewritten: {} -> {}", query, searchQuery);
         }
 
         final String finalQuery = searchQuery;
+        final QuerySignals finalSignals = signals;
 
         // ==========================================
         // Stage 2: 双路检索（并行执行）
         // ==========================================
         long sparseStart = System.currentTimeMillis();
-        long denseStart  = System.currentTimeMillis();
+        long denseStart = System.currentTimeMillis();
 
-        CompletableFuture<List<ScoredDoc>> sparseFuture =
-                CompletableFuture.supplyAsync(() -> sparseSearch(finalQuery));
-        CompletableFuture<List<ScoredDoc>> denseFuture =
-                CompletableFuture.supplyAsync(() -> denseSearch(finalQuery));
+        var sparseFuture = java.util.concurrent.CompletableFuture.supplyAsync(
+                () -> sparseSearch(finalQuery, finalSignals));
+        var denseFuture = java.util.concurrent.CompletableFuture.supplyAsync(
+                () -> denseSearch(finalQuery, finalSignals));
 
-        CompletableFuture.allOf(sparseFuture, denseFuture).join();
+        java.util.concurrent.CompletableFuture.allOf(sparseFuture, denseFuture).join();
 
         result.setSparseResults(sparseFuture.join());
         result.setSparseLatencyMs(System.currentTimeMillis() - sparseStart);
@@ -121,19 +138,21 @@ public class FourStageRagPipeline {
         // Stage 3: RRF 融合
         // ==========================================
         long fusionStart = System.currentTimeMillis();
-        List<ScoredDoc> fused = rrfFusion(result.getSparseResults(), result.getDenseResults());
+        List<ScoredDoc> fused = rrfFusion(result.getSparseResults(), result.getDenseResults(), finalSignals);
         result.setFusedResults(fused);
         result.setFusionLatencyMs(System.currentTimeMillis() - fusionStart);
 
         log.debug("Stage 3 RRF done: fused={}", fused.size());
 
         // ==========================================
-        // Stage 4: LLM Reranker 精排
-        //   输入 Top-N，输出 Top-finalTopK
+        // Stage 4: Reranker 精排
+        // 输入去重后的 Top-N，输出 Top-finalTopK
         // ==========================================
         long rerankStart = System.currentTimeMillis();
-        List<ScoredDoc> toRerank = fused.subList(0, Math.min(rerankTopN, fused.size()));
-        List<ScoredDoc> reranked = rerankerClient.rerank(query, toRerank, finalTopK);
+        List<ScoredDoc> deduplicated = deduplicateDocs(fused);
+        List<ScoredDoc> boosted = applyMetadataBoost(deduplicated, finalSignals);
+        List<ScoredDoc> rerankCandidates = boosted.subList(0, Math.min(rerankTopN, boosted.size()));
+        List<ScoredDoc> reranked = rerankerClient.rerank(query, rerankCandidates, finalTopK);
         result.setFinalResults(reranked);
         result.setRerankLatencyMs(System.currentTimeMillis() - rerankStart);
 
@@ -142,44 +161,56 @@ public class FourStageRagPipeline {
     }
 
     // =====================================================
-    // Stage 2a: 稀疏检索（MySQL FULLTEXT BM25）
+    // Stage 2a: 稀疏检索（MySQL FULLTEXT）
     // =====================================================
 
     /**
-     * MySQL FULLTEXT 全文检索（BM25 稀疏路径）。
+     * MySQL FULLTEXT 稀疏检索路径
      *
-     * <p>面试要点：为什么用 MySQL FULLTEXT 而非 Elasticsearch？
-     * → 现有系统已有 MySQL，引入 ES 增加运维负担。
-     *   MySQL 8.0 的 FULLTEXT + ngram 对中文有基础支持，
-     *   配合 Boolean Mode 可以做关键词精确匹配（条款号如 "6.3.2"）。
+     * <p>本轮优化点：
+     * <ol>
+     *   <li>先用 Jieba 对中文 query 分词，再生成稀疏查询串</li>
+     *   <li>改用 NATURAL LANGUAGE MODE，而不是 Boolean Mode</li>
+     *   <li>保留数据库返回的真实 FULLTEXT score</li>
+     *   <li>当 query 中明确包含 bridgeId 时，直接走桥梁过滤版查询</li>
+     * </ol>
      */
-    private List<ScoredDoc> sparseSearch(String query) {
-        String booleanQuery = Arrays.stream(query.split("\\s+"))
-                .filter(w -> w.length() >= 2)
-                .map(w -> "+" + w + "*")
-                .collect(Collectors.joining(" "));
-        if (booleanQuery.isBlank()) {
-            booleanQuery = query;
-        }
+    private List<ScoredDoc> sparseSearch(String query, QuerySignals signals) {
+        String sparseQuery = queryTokenizer.buildSparseQuery(query);
+        List<String> tokens = queryTokenizer.tokenize(query);
 
-        String finalBooleanQuery = booleanQuery;
-        return defectRepo.fullTextSearchGlobal(finalBooleanQuery, sparseTopK).stream()
-                .map(defect -> new ScoredDoc(
-                        "defect-" + defect.getId(),
-                        formatDefectAsDoc(defect),
-                        "SPARSE",
-                        1.0,
-                        Map.of(
-                                "type", "defect_record",
-                                "bridgeId", defect.getBridgeId() != null ? defect.getBridgeId() : "",
-                                "defectType", defect.getDefectType() != null ? defect.getDefectType() : ""
-                        )
-                ))
+        log.debug("Sparse query built: original='{}', sparse='{}', tokens={}",
+                query, sparseQuery, tokens);
+
+        List<DefectSearchHit> hits = signals.bridgeId() != null
+                ? defectRepo.fullTextSearch(signals.bridgeId(), sparseQuery, sparseTopK)
+                : defectRepo.fullTextSearchGlobal(sparseQuery, sparseTopK);
+
+        return hits.stream()
+                .map(this::toSparseDoc)
+                .map(doc -> applyMetadataBoost(doc, signals))
+                .sorted(Comparator.comparingDouble(ScoredDoc::score).reversed())
+                .limit(sparseTopK)
                 .collect(Collectors.toList());
     }
 
-    private String formatDefectAsDoc(com.bridge.agent.entity.DefectRecord defect) {
-        return String.format("【%s】%s\n病害类型：%s，等级：%s类，规范依据：%s\n%s",
+    private ScoredDoc toSparseDoc(DefectSearchHit hit) {
+        return new ScoredDoc(
+                "defect-" + hit.getId(),
+                formatDefectAsDoc(hit),
+                "SPARSE",
+                hit.getScore() != null ? hit.getScore() : 0.0,
+                Map.of(
+                        "type", "defect_record",
+                        "bridgeId", safe(hit.getBridgeId()),
+                        "defectType", safe(hit.getDefectType()),
+                        "standardRef", safe(hit.getStandardRef())
+                )
+        );
+    }
+
+    private String formatDefectAsDoc(DefectSearchHit defect) {
+        return String.format("【%s】%s%n病害类型：%s，等级：%s类，规范依据：%s%n%s",
                 defect.getComponent(),
                 defect.getDescription(),
                 defect.getDefectType(),
@@ -193,12 +224,16 @@ public class FourStageRagPipeline {
     // =====================================================
 
     /**
-     * Qdrant 向量检索（稠密语义路径）。
+     * Qdrant 向量检索（稠密语义路径）
      *
-     * <p>使用 Spring AI VectorStore 统一抽象，底层换成 PGVector 或其他
-     * 向量库时，这里代码无需修改。
+     * <p>本轮优化点：
+     * <ul>
+     *   <li>优先从 metadata 中读取真实相似度/距离分数</li>
+     *   <li>拿不到时再退化为“按排名模拟分数”</li>
+     *   <li>召回后也应用 bridgeId / defectType metadata 加权</li>
+     * </ul>
      */
-    private List<ScoredDoc> denseSearch(String query) {
+    private List<ScoredDoc> denseSearch(String query, QuerySignals signals) {
         SearchRequest request = SearchRequest.builder()
                 .query(query)
                 .topK(denseTopK)
@@ -206,18 +241,44 @@ public class FourStageRagPipeline {
 
         List<Document> docs = vectorStore.similaritySearch(request);
 
-        return IntStream.range(0, docs.size())
-                .mapToObj(i -> {
-                    Document doc = docs.get(i);
-                    return new ScoredDoc(
-                            doc.getId(),
-                            doc.getText(),
-                            "DENSE",
-                            1.0 - (double) i / docs.size(), // 排名越靠前分数越高
-                            doc.getMetadata()
-                    );
-                })
-                .collect(Collectors.toList());
+        List<ScoredDoc> scored = new ArrayList<>();
+        for (int i = 0; i < docs.size(); i++) {
+            Document doc = docs.get(i);
+            double score = extractDenseScore(doc, i, docs.size());
+            ScoredDoc scoredDoc = new ScoredDoc(
+                    doc.getId(),
+                    doc.getText(),
+                    "DENSE",
+                    score,
+                    doc.getMetadata()
+            );
+            scored.add(applyMetadataBoost(scoredDoc, signals));
+        }
+
+        scored.sort(Comparator.comparingDouble(ScoredDoc::score).reversed());
+        return scored;
+    }
+
+    private double extractDenseScore(Document doc, int rankIndex, int totalSize) {
+        if (doc.getMetadata() != null) {
+            Double score = getDouble(doc.getMetadata(), "score");
+            if (score == null) score = getDouble(doc.getMetadata(), "similarity");
+            if (score == null) score = getDouble(doc.getMetadata(), "relevance");
+            if (score != null) {
+                return score;
+            }
+
+            Double distance = getDouble(doc.getMetadata(), "distance");
+            if (distance == null) distance = getDouble(doc.getMetadata(), "_distance");
+            if (distance != null) {
+                return 1.0 / (1.0 + distance);
+            }
+        }
+
+        if (totalSize <= 0) {
+            return 0.0;
+        }
+        return 1.0 - (double) rankIndex / totalSize;
     }
 
     // =====================================================
@@ -225,44 +286,70 @@ public class FourStageRagPipeline {
     // =====================================================
 
     /**
-     * Reciprocal Rank Fusion 融合稀疏和稠密检索结果。
+     * Reciprocal Rank Fusion 融合稀疏和稠密结果
      *
-     * <p>RRF 公式：score(d) = Σ 1/(k + rank(d, list))
-     *
-     * <p>面试要点：
-     * "RRF 只看每个文档在各路排名中的位置，不看具体分数。
-     *  这解决了 BM25 分数（正整数）和余弦相似度（0-1浮点）量纲不同的问题，
-     *  无需任何标准化，直接混排。k=60 是实验证明的稳定值。"
+     * <p>本轮优化点：
+     * <ul>
+     *   <li>限制每一路参与融合的候选集合大小</li>
+     *   <li>融合后继续应用 metadata 加权，确保结构化信号能影响排序</li>
+     * </ul>
      */
-    private List<ScoredDoc> rrfFusion(List<ScoredDoc> sparse, List<ScoredDoc> dense) {
+    private List<ScoredDoc> rrfFusion(List<ScoredDoc> sparse, List<ScoredDoc> dense, QuerySignals signals) {
+        List<ScoredDoc> sparseLimited = sparse.subList(0, Math.min(fusionTopK, sparse.size()));
+        List<ScoredDoc> denseLimited = dense.subList(0, Math.min(fusionTopK, dense.size()));
+
         Map<String, Double> scores = new LinkedHashMap<>();
         Map<String, ScoredDoc> docMap = new HashMap<>();
 
-        // 稀疏路径贡献分数
-        for (int i = 0; i < sparse.size(); i++) {
-            String id = sparse.get(i).id();
+        for (int i = 0; i < sparseLimited.size(); i++) {
+            String id = sparseLimited.get(i).id();
             scores.merge(id, 1.0 / (RRF_K + i + 1), Double::sum);
-            docMap.putIfAbsent(id, sparse.get(i));
+            docMap.putIfAbsent(id, sparseLimited.get(i));
         }
 
-        // 稠密路径贡献分数
-        for (int i = 0; i < dense.size(); i++) {
-            String id = dense.get(i).id();
+        for (int i = 0; i < denseLimited.size(); i++) {
+            String id = denseLimited.get(i).id();
             scores.merge(id, 1.0 / (RRF_K + i + 1), Double::sum);
-            docMap.putIfAbsent(id, dense.get(i));
+            docMap.putIfAbsent(id, denseLimited.get(i));
         }
 
-        // 按融合分数降序，返回带 FUSED 来源标记的文档
-        return scores.entrySet().stream()
+        List<ScoredDoc> fused = scores.entrySet().stream()
                 .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
                 .map(entry -> docMap.get(entry.getKey())
                         .withScore(entry.getValue())
                         .withSource("FUSED"))
                 .collect(Collectors.toList());
+
+        return applyMetadataBoost(fused, signals);
     }
 
-    private boolean needsRewrite(String query) {
-        return query.length() < 8 || query.split("\\s+").length < 2;
+    // =====================================================
+    // Query analysis / rewrite
+    // =====================================================
+
+    /**
+     * 是否需要做 query rewrite
+     *
+     * <p>旧版规则只看“长度”和“空格词数”，对中文过于粗糙。
+     * 新版综合考虑：
+     * <ul>
+     *   <li>是否已包含明确 bridgeId / 规范号</li>
+     *   <li>分词后 token 数量是否过少</li>
+     *   <li>query 是否过短、是否缺乏约束词</li>
+     * </ul>
+     */
+    private boolean needsRewrite(String query, QuerySignals signals) {
+        String normalized = query == null ? "" : query.replaceAll("\\s+", "");
+        if (normalized.length() <= 4) {
+            return true;
+        }
+        if (signals.hasStandardRef() || signals.bridgeId() != null) {
+            return false;
+        }
+        if (signals.tokens().size() <= 2) {
+            return true;
+        }
+        return normalized.length() < 10 && signals.defectType() == null;
     }
 
     private String rewriteQuery(String query) {
@@ -271,4 +358,121 @@ public class FourStageRagPipeline {
                 query
         ).trim();
     }
+
+    private QuerySignals analyzeQuery(String query) {
+        List<String> tokens = queryTokenizer.tokenize(query);
+        String normalized = query == null ? "" : query.trim();
+
+        String bridgeId = null;
+        Matcher bridgeMatcher = BRIDGE_ID_PATTERN.matcher(normalized);
+        if (bridgeMatcher.find()) {
+            bridgeId = bridgeMatcher.group().toUpperCase(Locale.ROOT);
+        }
+
+        String defectType = DEFECT_TYPE_KEYWORDS.stream()
+                .filter(normalized::contains)
+                .findFirst()
+                .orElse(null);
+
+        boolean hasStandardRef = STANDARD_REF_PATTERN.matcher(normalized).find();
+        return new QuerySignals(bridgeId, defectType, hasStandardRef, tokens);
+    }
+
+    // =====================================================
+    // Metadata / ranking helpers
+    // =====================================================
+
+    /**
+     * 对 bridgeId / defectType 等结构化信号做加权
+     *
+     * <p>当前策略保持简单可解释：
+     * 命中 bridgeId 权重大于 defectType，且只做轻量 boost，
+     * 不让规则完全压过原始检索分数。
+     */
+    private ScoredDoc applyMetadataBoost(ScoredDoc doc, QuerySignals signals) {
+        double boosted = doc.score();
+
+        String bridgeId = metadataValue(doc.metadata(), "bridgeId");
+        String defectType = metadataValue(doc.metadata(), "defectType");
+
+        if (signals.bridgeId() != null && signals.bridgeId().equalsIgnoreCase(bridgeId)) {
+            boosted += 0.30;
+        }
+        if (signals.defectType() != null && signals.defectType().equals(defectType)) {
+            boosted += 0.15;
+        }
+        if (signals.hasStandardRef() && !metadataValue(doc.metadata(), "standardRef").isBlank()) {
+            boosted += 0.05;
+        }
+
+        return doc.withScore(boosted);
+    }
+
+    private List<ScoredDoc> applyMetadataBoost(List<ScoredDoc> docs, QuerySignals signals) {
+        return docs.stream()
+                .map(doc -> applyMetadataBoost(doc, signals))
+                .sorted(Comparator.comparingDouble(ScoredDoc::score).reversed())
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * rerank 前去重
+     *
+     * <p>优先按 id 去重；如果 id 为空，再退回到 content 去重。
+     * 同一 key 只保留当前分数更高的一条。
+     */
+    private List<ScoredDoc> deduplicateDocs(List<ScoredDoc> docs) {
+        Map<String, ScoredDoc> dedup = new LinkedHashMap<>();
+        for (ScoredDoc doc : docs) {
+            String key = doc.id() != null && !doc.id().isBlank()
+                    ? doc.id()
+                    : doc.content();
+            ScoredDoc existing = dedup.get(key);
+            if (existing == null || doc.score() > existing.score()) {
+                dedup.put(key, doc);
+            }
+        }
+        return dedup.values().stream()
+                .sorted(Comparator.comparingDouble(ScoredDoc::score).reversed())
+                .collect(Collectors.toList());
+    }
+
+    private Double getDouble(Map<String, Object> metadata, String key) {
+        Object value = metadata.get(key);
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Number n) {
+            return n.doubleValue();
+        }
+        try {
+            return Double.parseDouble(value.toString());
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private String metadataValue(Map<String, Object> metadata, String key) {
+        if (metadata == null || !metadata.containsKey(key) || metadata.get(key) == null) {
+            return "";
+        }
+        return Objects.toString(metadata.get(key), "");
+    }
+
+    private String safe(String value) {
+        return value != null ? value : "";
+    }
+
+    /**
+     * 查询信号对象
+     *
+     * <p>把原始 query 中可提取的结构化信息集中起来，
+     * 后续 sparse / dense / fusion / rerank 前加权都可以复用。
+     */
+    private record QuerySignals(
+            String bridgeId,
+            String defectType,
+            boolean hasStandardRef,
+            List<String> tokens
+    ) {}
 }
