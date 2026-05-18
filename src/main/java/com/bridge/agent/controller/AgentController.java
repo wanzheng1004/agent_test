@@ -1,26 +1,32 @@
 package com.bridge.agent.controller;
 
+import com.bridge.agent.core.TerminationReason;
 import com.bridge.agent.orchestrator.AgentOrchestrator;
+import com.bridge.agent.orchestrator.dto.AgentChatResult;
 import com.bridge.agent.orchestrator.dto.ChatRequest;
+import com.bridge.agent.orchestrator.dto.SceneType;
+import com.bridge.agent.runtime.AgentEvent;
+import com.bridge.agent.runtime.AgentEventType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.MediaType;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.http.codec.ServerSentEvent;
+import org.springframework.web.bind.annotation.CrossOrigin;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
-/**
- * 主对话 API
- *
- * <p>提供两个端点：
- * <ul>
- *   <li>POST /api/agent/chat      — 普通 JSON 响应（简单场景）</li>
- *   <li>POST /api/agent/chat/stream — SSE 流式响应（推荐，用于前端实时显示）</li>
- * </ul>
- */
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+
 @RestController
 @RequestMapping("/api/agent")
-@CrossOrigin(origins = "*") // 开发环境允许跨域，生产环境配置具体域名
+@CrossOrigin(origins = "*")
 public class AgentController {
 
     private static final Logger log = LoggerFactory.getLogger(AgentController.class);
@@ -31,51 +37,60 @@ public class AgentController {
         this.orchestrator = orchestrator;
     }
 
-    /**
-     * 主对话接口（同步 JSON）
-     *
-     * <p>请求示例：
-     * <pre>
-     * POST /api/agent/chat
-     * {
-     *   "sessionId": "sess-uuid-001",
-     *   "userId": "user-001",
-     *   "message": "BRG-001 沿江大桥，明天要去检测"
-     * }
-     * </pre>
-     */
     @PostMapping("/chat")
     public ChatResponse chat(@RequestBody ChatRequest request) {
-        log.info("Chat request: sessionId={}, messageLen={}",
-                request.sessionId(), request.message().length());
-
         long start = System.currentTimeMillis();
-        String answer = orchestrator.chat(request);
+        AgentChatResult result = orchestrator.handle(request);
         long elapsed = System.currentTimeMillis() - start;
 
-        log.info("Chat response: sessionId={}, elapsed={}ms, answerLen={}",
-                request.sessionId(), elapsed, answer.length());
+        log.info("Chat response: sessionId={}, runId={}, scene={}, elapsed={}ms",
+                request.sessionId(), result.runId(), result.scene(), elapsed);
 
-        return new ChatResponse(request.sessionId(), answer, elapsed);
+        return new ChatResponse(
+                request.sessionId(),
+                result.answer(),
+                elapsed,
+                result.runId(),
+                result.scene(),
+                result.terminationReason());
     }
 
-    /**
-     * 主对话接口（SSE 流式）
-     *
-     * <p>适合前端实时显示生成过程。
-     * 当前实现：将完整响应拆分为字符流（真实流式需 Agent 支持 Flux 输出）。
-     */
     @PostMapping(value = "/chat/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public Flux<String> chatStream(@RequestBody ChatRequest request) {
-        return Mono.fromCallable(() -> orchestrator.chat(request))
-                .flux()
-                .flatMap(answer ->
-                        // 按句子拆分，模拟流式输出效果
-                        Flux.fromArray(answer.split("(?<=。|？|！|\\n)"))
-                )
-                .map(chunk -> chunk + "\n");
+    public Flux<ServerSentEvent<AgentEvent>> chatStream(@RequestBody ChatRequest request) {
+        return Mono.fromCallable(() -> orchestrator.handle(request))
+                .flatMapMany(result -> {
+                    List<AgentEvent> events = result.events();
+                    AgentEvent finalEvent = new AgentEvent(
+                            UUID.randomUUID().toString(),
+                            result.runId(),
+                            AgentEventType.RUN_FINISHED,
+                            result.scene() == null ? "Orchestrator" : result.scene().name(),
+                            result.answer(),
+                            Map.of("terminationReason",
+                                    result.terminationReason() == null ? "" : result.terminationReason().name()),
+                            Instant.now(),
+                            0
+                    );
+                    if (events.isEmpty()) {
+                        return Flux.just(finalEvent);
+                    }
+                    return Flux.fromIterable(events)
+                            .filter(event -> event.type() != AgentEventType.RUN_FINISHED)
+                            .concatWith(Mono.just(finalEvent));
+                })
+                .map(event -> ServerSentEvent.builder(event)
+                        .id(event.eventId())
+                        .event(event.type().name())
+                        .build());
     }
 
-    /** 响应 DTO */
-    public record ChatResponse(String sessionId, String answer, long elapsedMs) {}
+    public record ChatResponse(
+            String sessionId,
+            String answer,
+            long elapsedMs,
+            String runId,
+            SceneType scene,
+            TerminationReason terminationReason
+    ) {
+    }
 }

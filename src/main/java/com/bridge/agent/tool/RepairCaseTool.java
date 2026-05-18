@@ -41,8 +41,10 @@ public class RepairCaseTool {
         String query = buildSearchQuery(defectType, bridgeType, grade);
 
         // Qdrant 向量检索（Spring AI SearchRequest 支持 payload 过滤）
-        SearchRequest request = SearchRequest.query(query)
-                .withTopK(5);
+        SearchRequest request = SearchRequest.builder()
+                .query(query)
+                .topK(5)
+                .build();
         // 注：Spring AI 1.0.0 的 filter 语法：.withFilterExpression("defect_type == '" + defectType + "'")
         // 若 defect_cases collection 有对应 payload 字段可开启过滤
 

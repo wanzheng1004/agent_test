@@ -1,0 +1,22 @@
+spring:
+  application:
+    name: bridge-agent-demo
+  main:
+    lazy-initialization: true
+
+bridge:
+  runtime:
+    checkpoint-dir: data/checkpoints
+  demo:
+    mode: local
+    description: "Local demo profile for trace, checkpoint and HITL flows."
+  agent:
+    react:
+      max-iterations: 4
+      max-consecutive-errors: 2
+    session:
+      ttl-hours: 8
+
+logging:
+  level:
+    com.bridge.agent: INFO

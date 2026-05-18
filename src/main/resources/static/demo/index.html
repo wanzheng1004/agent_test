@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Bridge Agent Trace Console</title>
+    <style>
+        body { margin: 0; font-family: Arial, sans-serif; color: #1f2937; background: #f7f7f4; }
+        main { max-width: 1080px; margin: 0 auto; padding: 32px 20px; }
+        h1 { font-size: 28px; margin: 0 0 16px; }
+        section { margin-top: 20px; padding: 18px; background: #fff; border: 1px solid #d8d8d0; border-radius: 8px; }
+        label { display: block; font-weight: 700; margin-bottom: 8px; }
+        textarea, input { width: 100%; box-sizing: border-box; border: 1px solid #c7c7bd; border-radius: 6px; padding: 10px; font: inherit; }
+        textarea { min-height: 90px; resize: vertical; }
+        button { margin-top: 12px; padding: 10px 14px; border: 0; border-radius: 6px; background: #2563eb; color: white; font-weight: 700; cursor: pointer; }
+        pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #111827; color: #f9fafb; padding: 14px; border-radius: 6px; min-height: 180px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+    </style>
+</head>
+<body>
+<main>
+    <h1>Bridge Agent Trace Console</h1>
+    <section class="grid">
+        <div>
+            <label for="sessionId">Session ID</label>
+            <input id="sessionId" value="demo-session">
+        </div>
+        <div>
+            <label for="userId">User ID</label>
+            <input id="userId" value="demo-user">
+        </div>
+    </section>
+    <section>
+        <label for="message">Inspection request</label>
+        <textarea id="message">BRG-001 pier has a vertical crack, width 0.3mm, with seepage. Please rate it.</textarea>
+        <button onclick="runAgent()">Run Agent</button>
+    </section>
+    <section>
+        <label>Run response and trace</label>
+        <pre id="output">Waiting for a run...</pre>
+    </section>
+</main>
+<script>
+async function runAgent() {
+    const output = document.getElementById('output');
+    output.textContent = 'Running...';
+    const response = await fetch('/api/v2/agent/runs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            sessionId: document.getElementById('sessionId').value,
+            userId: document.getElementById('userId').value,
+            message: document.getElementById('message').value
+        })
+    });
+    output.textContent = JSON.stringify(await response.json(), null, 2);
+}
+</script>
+</body>
+</html>

@@ -2,7 +2,6 @@ spring:
   application:
     name: bridge-agent
 
-  # ===== 数据源 (MySQL) =====
   datasource:
     url: jdbc:mysql://localhost:3306/bridge_mgmt?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai
     username: ${DB_USER:bridge}
@@ -14,14 +13,13 @@ spring:
 
   jpa:
     hibernate:
-      ddl-auto: none          # 建表由 schema.sql 控制，不让 Hibernate 自动管理
+      ddl-auto: none
     show-sql: false
     properties:
       hibernate:
         dialect: org.hibernate.dialect.MySQLDialect
         format_sql: true
 
-  # ===== Redis (会话级记忆) =====
   data:
     redis:
       host: ${REDIS_HOST:localhost}
@@ -32,7 +30,6 @@ spring:
           max-active: 8
           max-idle: 4
 
-  # ===== Spring AI =====
   ai:
     openai:
       api-key: ${DEEPSEEK_API_KEY:${OPENAI_API_KEY:}}
@@ -42,21 +39,18 @@ spring:
           model: ${DEEPSEEK_MODEL:deepseek-chat}
           temperature: 0.1
           max-tokens: 2048
-
     vectorstore:
       qdrant:
         host: ${QDRANT_HOST:localhost}
-        port: 6334              # gRPC 端口
-        collection-name: bridge_standards   # 默认 collection（规范文档）
+        port: ${QDRANT_PORT:6334}
+        collection-name: ${QDRANT_COLLECTION:bridge_standards}
         initialize-schema: true
 
-  # ===== 缓存 =====
   cache:
     type: redis
     redis:
-      time-to-live: 86400000   # 默认 TTL 24h（ms）
+      time-to-live: 86400000
 
-# ===== 应用自定义配置 =====
 bridge:
   models:
     qwen:
@@ -78,20 +72,28 @@ bridge:
 
   agent:
     react:
-      max-iterations: 8         # ReAct 最大循环次数
-      max-consecutive-errors: 2 # 连续错误上限触发终止
+      max-iterations: 8
+      max-consecutive-errors: 2
     context:
-      full-window-size: 20      # 保留最近 N 轮完整对话
-      summary-threshold: 30     # 超过 N 轮触发压缩摘要
+      full-window-size: 20
+      summary-threshold: 30
     session:
-      ttl-hours: 8              # Redis 会话 TTL（小时）
+      ttl-hours: 8
     rag:
-      sparse-top-k: 20          # BM25 召回数量
-      dense-top-k: 20           # 向量检索召回数量
-      rerank-top-n: 5           # Reranker 精排输入数量
-      final-top-k: 3            # 最终送入 LLM 的上下文数量
+      sparse-top-k: 20
+      dense-top-k: 20
+      rerank-top-n: 5
+      final-top-k: 3
 
-# ===== 日志 =====
+  search-v3:
+    markdown-root: ${BRIDGE_MARKDOWN_ROOT:src/main/resources/standards-md}
+    sparse-top-k: 8
+    dense-top-k: 8
+    fusion-top-k: 8
+    rerank-top-n: 6
+    final-top-k: 4
+    rrf-k: 60
+
 logging:
   level:
     com.bridge.agent: DEBUG
